@@ -10,10 +10,14 @@ on:
         description: 'Version name (e.g., 1.0.0)'
         required: true
         default: '1.0.0'
+      version_code:
+        description: 'Version code (integer)'
+        required: true
+        default: '1'
       build_type:
         description: 'Build type'
         required: true
-        default: 'debug'
+        default: 'release'
         type: choice
         options:
           - debug
@@ -60,55 +64,221 @@ jobs:
       - name: 🔄 Sync Capacitor
         run: npx cap sync android
 
+      - name: 🔐 Setup Release Keystore
+        if: github.event.inputs.build_type == 'release'
+        run: |
+          # Create keystore directory
+          mkdir -p android/app/keystores
+          
+          # Decode keystore from base64 secret or generate debug keystore
+          if [ -n "${{ secrets.ANDROID_KEYSTORE_BASE64 }}" ]; then
+            echo "${{ secrets.ANDROID_KEYSTORE_BASE64 }}" | base64 -d > android/app/keystores/release.keystore
+          else
+            # Generate a temporary release keystore for CI
+            keytool -genkeypair -v \
+              -keystore android/app/keystores/release.keystore \
+              -alias unicornpos \
+              -keyalg RSA \
+              -keysize 2048 \
+              -validity 10000 \
+              -storepass android123 \
+              -keypass android123 \
+              -dname "CN=Unicorn POS, OU=Dev, O=Unicorn, L=Jakarta, ST=DKI, C=ID"
+          fi
+          
+          # Create signing config
+          cat > android/app/keystores/keystore.properties << EOF
+          storeFile=keystores/release.keystore
+          storePassword=${{ secrets.ANDROID_KEYSTORE_PASSWORD || 'android123' }}
+          keyAlias=${{ secrets.ANDROID_KEY_ALIAS || 'unicornpos' }}
+          keyPassword=${{ secrets.ANDROID_KEY_PASSWORD || 'android123' }}
+          EOF
+
+      - name: 📝 Configure Gradle for Release
+        if: github.event.inputs.build_type == 'release'
+        run: |
+          # Update build.gradle with signing config
+          cat > android/app/build.gradle << 'GRADLE'
+          apply plugin: 'com.android.application'
+
+          def keystorePropertiesFile = rootProject.file("app/keystores/keystore.properties")
+          def keystoreProperties = new Properties()
+          if (keystorePropertiesFile.exists()) {
+              keystoreProperties.load(new FileInputStream(keystorePropertiesFile))
+          }
+
+          android {
+              namespace "com.unicornpos.app"
+              compileSdk 34
+              
+              defaultConfig {
+                  applicationId "com.unicornpos.app"
+                  minSdk 22
+                  targetSdk 34
+                  versionCode ${{ github.event.inputs.version_code || '1' }}
+                  versionName "${{ github.event.inputs.version_name || '1.0.0' }}"
+                  testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
+              }
+              
+              signingConfigs {
+                  release {
+                      storeFile file(keystoreProperties['storeFile'] ?: 'keystores/release.keystore')
+                      storePassword keystoreProperties['storePassword'] ?: 'android123'
+                      keyAlias keystoreProperties['keyAlias'] ?: 'unicornpos'
+                      keyPassword keystoreProperties['keyPassword'] ?: 'android123'
+                  }
+              }
+              
+              buildTypes {
+                  debug {
+                      debuggable true
+                  }
+                  release {
+                      minifyEnabled true
+                      shrinkResources true
+                      proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+                      signingConfig signingConfigs.release
+                  }
+              }
+              
+              buildFeatures {
+                  buildConfig true
+              }
+              
+              compileOptions {
+                  sourceCompatibility JavaVersion.VERSION_21
+                  targetCompatibility JavaVersion.VERSION_21
+              }
+          }
+
+          repositories {
+              flatDir {
+                  dirs '../capacitor-cordova-android-plugins/src/main/libs', 'libs'
+              }
+          }
+
+          dependencies {
+              implementation project(':capacitor-android')
+              implementation "androidx.appcompat:appcompat:1.6.1"
+              implementation "androidx.coordinatorlayout:coordinatorlayout:1.2.0"
+              implementation "androidx.core:core-splashscreen:1.0.1"
+          }
+
+          apply from: 'capacitor.build.gradle'
+          GRADLE
+
       - name: 🏗️ Build Debug APK
+        if: github.event.inputs.build_type == 'debug' || github.event.inputs.build_type == ''
         run: |
           cd android
           chmod +x gradlew
           ./gradlew assembleDebug
 
+      - name: 🏗️ Build Release APK (Signed + Proguard)
+        if: github.event.inputs.build_type == 'release'
+        run: |
+          cd android
+          chmod +x gradlew
+          ./gradlew assembleRelease --stacktrace
+
+      - name: 📦 Build Release AAB (Play Store Bundle)
+        if: github.event.inputs.build_type == 'release'
+        run: |
+          cd android
+          ./gradlew bundleRelease --stacktrace
+
       - name: 📋 Prepare Artifacts
         run: |
           mkdir -p artifacts
           
+          # Debug APK
           if [ -f android/app/build/outputs/apk/debug/app-debug.apk ]; then
             cp android/app/build/outputs/apk/debug/app-debug.apk artifacts/unicorn-pos-debug.apk
-            echo "✅ APK copied successfully"
+            echo "✅ Debug APK ready"
+          fi
+          
+          # Release APK
+          if [ -f android/app/build/outputs/apk/release/app-release.apk ]; then
+            cp android/app/build/outputs/apk/release/app-release.apk artifacts/unicorn-pos-release.apk
+            echo "✅ Release APK ready (signed + proguard)"
+          fi
+          
+          # Release AAB
+          if [ -f android/app/build/outputs/bundle/release/app-release.aab ]; then
+            cp android/app/build/outputs/bundle/release/app-release.aab artifacts/unicorn-pos-release.aab
+            echo "✅ Release AAB ready (Play Store bundle)"
           fi
           
           ls -la artifacts/
 
       - name: 📤 Upload Debug APK
+        if: github.event.inputs.build_type == 'debug' || github.event.inputs.build_type == ''
         uses: actions/upload-artifact@v4
         with:
           name: unicorn-pos-debug-apk
           path: artifacts/unicorn-pos-debug.apk
           retention-days: 30
 
+      - name: 📤 Upload Release APK
+        if: github.event.inputs.build_type == 'release'
+        uses: actions/upload-artifact@v4
+        with:
+          name: unicorn-pos-release-apk
+          path: artifacts/unicorn-pos-release.apk
+          retention-days: 90
+
+      - name: 📤 Upload Release AAB
+        if: github.event.inputs.build_type == 'release'
+        uses: actions/upload-artifact@v4
+        with:
+          name: unicorn-pos-release-aab
+          path: artifacts/unicorn-pos-release.aab
+          retention-days: 90
+
       - name: 📋 Build Summary
         run: |
+          BUILD_TYPE="${{ github.event.inputs.build_type || 'debug' }}"
+          VERSION="${{ github.event.inputs.version_name || '1.0.0' }}"
+          
           echo '## 🦄 Unicorn POS Android Build Complete!' >> $GITHUB_STEP_SUMMARY
           echo '' >> $GITHUB_STEP_SUMMARY
           echo '| Property | Value |' >> $GITHUB_STEP_SUMMARY
           echo '|----------|-------|' >> $GITHUB_STEP_SUMMARY
-          echo '| Version | 1.0.0 |' >> $GITHUB_STEP_SUMMARY
-          echo '| Build Type | debug |' >> $GITHUB_STEP_SUMMARY
+          echo "| Version | $VERSION |" >> $GITHUB_STEP_SUMMARY
+          echo "| Build Type | $BUILD_TYPE |" >> $GITHUB_STEP_SUMMARY
           echo '| Commit | `${{ github.sha }}` |' >> $GITHUB_STEP_SUMMARY
           echo '' >> $GITHUB_STEP_SUMMARY
+          
+          if [ "$BUILD_TYPE" == "release" ]; then
+            echo '### 🔐 Release Build Features' >> $GITHUB_STEP_SUMMARY
+            echo '- ✅ Code signing enabled' >> $GITHUB_STEP_SUMMARY
+            echo '- ✅ ProGuard minification enabled' >> $GITHUB_STEP_SUMMARY
+            echo '- ✅ Resource shrinking enabled' >> $GITHUB_STEP_SUMMARY
+            echo '- ✅ AAB bundle for Play Store' >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          echo '' >> $GITHUB_STEP_SUMMARY
           echo '### 📥 Download' >> $GITHUB_STEP_SUMMARY
-          echo 'APK file available in the **Artifacts** section above.' >> $GITHUB_STEP_SUMMARY
+          echo 'Files available in the **Artifacts** section above.' >> $GITHUB_STEP_SUMMARY
 
       - name: 📋 Export Download Links
         run: |
+          BUILD_TYPE="${{ github.event.inputs.build_type || 'debug' }}"
+          
           cat > artifacts/download_links.json << EOF
           {
             "build_info": {
-              "version": "1.0.0",
-              "build_type": "debug",
+              "version": "${{ github.event.inputs.version_name || '1.0.0' }}",
+              "version_code": "${{ github.event.inputs.version_code || '1' }}",
+              "build_type": "$BUILD_TYPE",
               "commit": "${{ github.sha }}",
-              "timestamp": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+              "timestamp": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+              "signed": $([ "$BUILD_TYPE" == "release" ] && echo "true" || echo "false"),
+              "minified": $([ "$BUILD_TYPE" == "release" ] && echo "true" || echo "false"),
+              "shrink_resources": $([ "$BUILD_TYPE" == "release" ] && echo "true" || echo "false")
             },
             "artifacts_url": "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}",
-            "status": "SUCCESS"
+            "status": "$([ "$BUILD_TYPE" == "release" ] && echo "SIGNED_SUCCESS" || echo "SUCCESS")"
           }
           EOF
           cat artifacts/download_links.json
