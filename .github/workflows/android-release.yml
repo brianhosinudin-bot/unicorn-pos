@@ -1,0 +1,173 @@
+name: Build Android Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      version_name:
+        description: 'Version name (e.g., 1.0.0)'
+        required: true
+        default: '1.0.0'
+      build_type:
+        description: 'Build type'
+        required: true
+        default: 'debug'
+        type: choice
+        options:
+          - debug
+          - release
+
+env:
+  NODE_VERSION: '18'
+  JAVA_VERSION: '17'
+
+jobs:
+  build-android:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: 📥 Checkout
+        uses: actions/checkout@v4
+
+      - name: 📦 Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+
+      - name: ☕ Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: ${{ env.JAVA_VERSION }}
+
+      - name: 🤖 Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: 📦 Install dependencies
+        run: npm ci
+
+      - name: 📦 Install Capacitor
+        run: npm install @capacitor/cli @capacitor/core @capacitor/android
+
+      - name: 🏗️ Build Next.js
+        run: npm run build
+
+      - name: 🤖 Add Android Platform
+        run: npx cap add android || true
+
+      - name: 🔄 Sync Capacitor
+        run: npx cap sync android
+
+      - name: 🏗️ Build Debug APK
+        if: github.event.inputs.build_type == 'debug' || github.event.inputs.build_type == ''
+        run: |
+          cd android
+          chmod +x gradlew
+          ./gradlew assembleDebug
+
+      - name: 🔐 Decode Keystore
+        if: github.event.inputs.build_type == 'release'
+        run: |
+          mkdir -p android/keystores
+          echo "${{ secrets.ANDROID_KEYSTORE_BASE64 }}" | base64 -d > android/keystores/release.keystore
+          
+          cat > android/keystores/keystore.properties << EOF
+          storeFile=keystores/release.keystore
+          storePassword=${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          keyAlias=${{ secrets.ANDROID_KEY_ALIAS }}
+          keyPassword=${{ secrets.ANDROID_KEY_PASSWORD }}
+          EOF
+
+      - name: 🏗️ Build Release APK
+        if: github.event.inputs.build_type == 'release'
+        run: |
+          cd android
+          chmod +x gradlew
+          ./gradlew assembleRelease
+
+      - name: 📦 Build Release AAB
+        if: github.event.inputs.build_type == 'release'
+        run: |
+          cd android
+          ./gradlew bundleRelease
+
+      - name: 📋 Prepare Artifacts
+        run: |
+          mkdir -p artifacts
+          
+          if [ -f android/app/build/outputs/apk/debug/app-debug.apk ]; then
+            cp android/app/build/outputs/apk/debug/app-debug.apk artifacts/unicorn-pos-debug.apk
+          fi
+          
+          if [ -f android/app/build/outputs/apk/release/app-release.apk ]; then
+            cp android/app/build/outputs/apk/release/app-release.apk artifacts/unicorn-pos-release.apk
+          fi
+          
+          if [ -f android/app/build/outputs/bundle/release/app-release.aab ]; then
+            cp android/app/build/outputs/bundle/release/app-release.aab artifacts/unicorn-pos-release.aab
+          fi
+          
+          ls -la artifacts/
+
+      - name: 📤 Upload Debug APK
+        if: github.event.inputs.build_type == 'debug' || github.event.inputs.build_type == ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: unicorn-pos-debug-apk
+          path: artifacts/unicorn-pos-debug.apk
+          retention-days: 30
+
+      - name: 📤 Upload Release APK
+        if: github.event.inputs.build_type == 'release'
+        uses: actions/upload-artifact@v4
+        with:
+          name: unicorn-pos-release-apk
+          path: artifacts/unicorn-pos-release.apk
+          retention-days: 90
+
+      - name: 📤 Upload Release AAB
+        if: github.event.inputs.build_type == 'release'
+        uses: actions/upload-artifact@v4
+        with:
+          name: unicorn-pos-release-aab
+          path: artifacts/unicorn-pos-release.aab
+          retention-days: 90
+
+      - name: 📋 Build Summary
+        run: |
+          echo '## 🦄 Unicorn POS Android Build Complete!' >> $GITHUB_STEP_SUMMARY
+          echo '' >> $GITHUB_STEP_SUMMARY
+          echo '| Property | Value |' >> $GITHUB_STEP_SUMMARY
+          echo '|----------|-------|' >> $GITHUB_STEP_SUMMARY
+          echo '| Version | ${{ github.event.inputs.version_name || '1.0.0' }} |' >> $GITHUB_STEP_SUMMARY
+          echo '| Build Type | ${{ github.event.inputs.build_type || 'debug' }} |' >> $GITHUB_STEP_SUMMARY
+          echo '| Commit | `${{ github.sha }}` |' >> $GITHUB_STEP_SUMMARY
+          echo '' >> $GITHUB_STEP_SUMMARY
+          echo '### 📥 Download' >> $GITHUB_STEP_SUMMARY
+          echo 'APK file available in the **Artifacts** section above.' >> $GITHUB_STEP_SUMMARY
+
+      - name: 📋 Export Download Links
+        run: |
+          cat > artifacts/download_links.json << EOF
+          {
+            "build_info": {
+              "version": "${{ github.event.inputs.version_name || '1.0.0' }}",
+              "build_type": "${{ github.event.inputs.build_type || 'debug' }}",
+              "commit": "${{ github.sha }}",
+              "timestamp": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            },
+            "artifacts_url": "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}",
+            "status": "SUCCESS"
+          }
+          EOF
+          cat artifacts/download_links.json
+
+      - name: 📤 Upload Download Links
+        uses: actions/upload-artifact@v4
+        with:
+          name: download-links
+          path: artifacts/download_links.json
+          retention-days: 90
