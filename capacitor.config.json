@@ -1,0 +1,9 @@
+{
+  "appId": "com.unicornpos.app",
+  "appName": "Unicorn POS",
+  "webDir": ".next",
+  "bundledWebRuntime": false,
+  "server": {
+    "androidScheme": "https"
+  }
+}
